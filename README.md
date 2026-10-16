@@ -1,11 +1,11 @@
-# 🔌 Microservizio: `mar-serial-bridge`
+# Microservizio: `mar-serial-bridge`
 
 **Hardware Abstraction Layer & Watchdog Heartbeat Manager**  
 *Parte dell'architettura a microservizi M.A.R. (Multi-legged Autonomous Robot)*
 
 ---
 
-## 🎯 Ruolo nell'Architettura a Microservizi
+## Ruolo nell'Architettura a Microservizi
 
 `mar-serial-bridge` funge da **ponte hardware deterministico** tra il bus di comunicazione ad alto livello (MQTT / WebSockets su Raspberry Pi 5) e il microcontrollore fisico che muove le zampe (`mar-firmware`).
 
@@ -25,7 +25,7 @@ Le sue responsabilità architetturali sono:
 
 ---
 
-## 📡 Interfacce e Topic MQTT
+## Interfacce e Topic MQTT
 
 | Canale / Topic | Direzione | Formato Payload | Descrizione |
 | :--- | :--- | :--- | :--- |
@@ -36,7 +36,7 @@ Le sue responsabilità architetturali sono:
 
 ---
 
-## 📂 Struttura della Cartella
+## Struttura del Repository
 
 ```text
 mar-serial-bridge/
@@ -48,7 +48,7 @@ mar-serial-bridge/
 
 ---
 
-## 🚀 Avvio del Microservizio
+## Avvio del Microservizio
 
 ### 1. Installazione Dipendenze
 ```bash

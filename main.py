@@ -65,11 +65,21 @@ def on_mqtt_message(client, userdata, msg):
             driver.emergency_stop()
 
     elif topic == "mar/control/motion":
-        cmd_type = data.get("cmd", "")
-        param = data.get("param", "")
-        formatted_cmd = f"CMD:{cmd_type}"
-        if param != "":
-            formatted_cmd += f",{param}"
+        cmd_type = str(data.get("cmd", "")).strip()
+        param = str(data.get("param", "")).strip()
+
+        # Support both direct keywords (AVANTI, STOP_TERRA, etc.) and CMD: structured protocol
+        if cmd_type.upper() in ("AVANTI", "STOP", "STOP_TERRA", "GIRA_DX", "GIRA_SX"):
+            formatted_cmd = cmd_type.upper()
+        elif cmd_type.startswith("CMD:"):
+            formatted_cmd = cmd_type
+            if param != "":
+                formatted_cmd += f",{param}"
+        else:
+            formatted_cmd = f"CMD:{cmd_type}"
+            if param != "":
+                formatted_cmd += f",{param}"
+
         print(f"[FORWARD TO ARDUINO]: {formatted_cmd}")
         if driver:
             driver.send_command(formatted_cmd)
