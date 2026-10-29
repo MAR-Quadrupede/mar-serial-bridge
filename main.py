@@ -13,6 +13,7 @@ import signal
 import threading
 
 from serial_driver import ArduinoSerialDriver
+from imu_driver import MPU6050Driver
 
 # Optional MQTT import
 try:
@@ -21,14 +22,28 @@ except ImportError:
     mqtt = None
 
 
+def env_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in ("true", "1", "yes", "on")
+
+
 MQTT_BROKER = os.getenv("MQTT_BROKER", "localhost")
 MQTT_PORT = int(os.getenv("MQTT_PORT", "1883"))
 SERIAL_PORT = os.getenv("SERIAL_PORT", "")
 BAUDRATE = int(os.getenv("SERIAL_BAUD", "115200"))
 HEARTBEAT_INTERVAL = float(os.getenv("HEARTBEAT_SEC", "0.2"))  # 5 Hz heartbeat
 
+# IMU GY-521 / MPU-6050 on Raspberry Pi I2C bus
+IMU_ENABLED = env_bool("IMU_ENABLED", True)
+IMU_I2C_BUS = int(os.getenv("IMU_I2C_BUS", "1"))
+IMU_ADDRESS = int(os.getenv("IMU_ADDRESS", "0x68"), 0)
+IMU_RATE_HZ = float(os.getenv("IMU_RATE_HZ", "100"))
+
 running = True
 driver: ArduinoSerialDriver = None
+imu_driver: MPU6050Driver = None
 mqtt_client = None
 
 
@@ -49,6 +64,26 @@ def on_arduino_telemetry(raw_line: str):
                     payload[k.lower()] = v
 
         mqtt_client.publish("mar/hardware/telemetry", json.dumps(payload))
+
+
+def on_imu_sample(gyro, acc):
+    """Callback for each raw MPU-6050 sample -> `mar/imu/raw` (consumed by the decision engine)."""
+    if mqtt_client and mqtt_client.is_connected():
+        # Reuse the driver instance to build the payload (keeps scales in sync)
+        payload = imu_driver.sample_payload(gyro, acc) if imu_driver else {
+            "timestamp": time.time(), "source": "mpu6050", "gyro": gyro, "acc": acc
+        }
+        mqtt_client.publish("mar/imu/raw", json.dumps(payload))
+
+
+def on_imu_status(available: bool, reason: str):
+    """Publishes IMU availability changes so the dashboard/engine can react."""
+    if mqtt_client and mqtt_client.is_connected():
+        mqtt_client.publish("mar/imu/status", json.dumps({
+            "timestamp": time.time(),
+            "available": available,
+            "reason": reason
+        }))
 
 
 def on_mqtt_message(client, userdata, msg):
@@ -99,11 +134,13 @@ def signal_handler(sig, frame):
     running = False
     if driver:
         driver.close()
+    if imu_driver:
+        imu_driver.stop()
     sys.exit(0)
 
 
 def main():
-    global driver, mqtt_client, running
+    global driver, imu_driver, mqtt_client, running
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
@@ -136,6 +173,20 @@ def main():
             print(f"  ✓ Connesso a MQTT Broker ({MQTT_BROKER}:{MQTT_PORT})")
         except Exception as e:
             print(f"  ⚠️ Connessione MQTT non riuscita ({e}). Modalità autonoma.")
+
+    # 4. IMU GY-521 / MPU-6050: acquisizione raw verso `mar/imu/raw`
+    if IMU_ENABLED:
+        imu_driver = MPU6050Driver(
+            bus=IMU_I2C_BUS,
+            address=IMU_ADDRESS,
+            rate_hz=IMU_RATE_HZ,
+            on_sample=on_imu_sample,
+            on_status=on_imu_status
+        )
+        imu_driver.start()
+        print(f"  ✓ IMU: lettura I2C avviata a {IMU_RATE_HZ:.0f} Hz su /dev/i2c-{IMU_I2C_BUS}")
+    else:
+        print("  ℹ️ IMU disabilitata (IMU_ENABLED=false).")
 
     print("\n[SERIAL-BRIDGE] Servizio attivo in ascolto. Premi Ctrl+C per uscire.\n")
 
