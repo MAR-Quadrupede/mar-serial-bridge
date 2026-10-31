@@ -14,6 +14,7 @@ import threading
 
 from serial_driver import ArduinoSerialDriver
 from imu_driver import MPU6050Driver
+from ultrasonic_driver import UltrasonicUsbDriver
 
 # Optional MQTT import
 try:
@@ -41,10 +42,31 @@ IMU_I2C_BUS = int(os.getenv("IMU_I2C_BUS", "1"))
 IMU_ADDRESS = int(os.getenv("IMU_ADDRESS", "0x68"), 0)
 IMU_RATE_HZ = float(os.getenv("IMU_RATE_HZ", "100"))
 
+# Makeblock Ultrasonic V3 on second Arduino (USB) — pin A2 sketch in local/
+ULTRASONIC_ENABLED = env_bool("ULTRASONIC_ENABLED", True)
+ULTRASONIC_PORT = os.getenv("ULTRASONIC_PORT", "")  # empty = auto (prefer ttyUSB*)
+ULTRASONIC_BAUD = int(os.getenv("ULTRASONIC_BAUD", "115200"))
+
 running = True
 driver: ArduinoSerialDriver = None
 imu_driver: MPU6050Driver = None
+us_driver: UltrasonicUsbDriver = None
 mqtt_client = None
+
+
+def publish_ultrasonic(cm: float):
+    """Publish frontal ultrasonic range (Makeblock V3 / Arduino USB)."""
+    if not (mqtt_client and mqtt_client.is_connected()):
+        return
+    payload = {
+        "timestamp": time.time(),
+        "us_cm": round(float(cm), 1),
+        "ultrasonic_cm": round(float(cm), 1),
+        "ultrasonic": round(float(cm), 1),
+        "source": "makeblock_v3_a2",
+    }
+    mqtt_client.publish("mar/ultrasonic/range", json.dumps(payload))
+    mqtt_client.publish("mar/hardware/telemetry", json.dumps(payload))
 
 
 def on_arduino_telemetry(raw_line: str):
@@ -62,6 +84,11 @@ def on_arduino_telemetry(raw_line: str):
                 if "=" in p:
                     k, v = p.split("=", 1)
                     payload[k.lower()] = v
+                    if k.lower() in ("us", "ultrasonic", "us_cm"):
+                        try:
+                            publish_ultrasonic(float(v))
+                        except Exception:
+                            pass
 
         mqtt_client.publish("mar/hardware/telemetry", json.dumps(payload))
 
@@ -136,11 +163,13 @@ def signal_handler(sig, frame):
         driver.close()
     if imu_driver:
         imu_driver.stop()
+    if us_driver:
+        us_driver.stop()
     sys.exit(0)
 
 
 def main():
-    global driver, imu_driver, mqtt_client, running
+    global driver, imu_driver, us_driver, mqtt_client, running
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
 
@@ -188,14 +217,35 @@ def main():
     else:
         print("  ℹ️ IMU disabilitata (IMU_ENABLED=false).")
 
+    # 5. Ultrasuoni Makeblock su Arduino USB dedicato (escluso il port motion)
+    if ULTRASONIC_ENABLED:
+        exclude = []
+        if driver and getattr(driver, "port_name", ""):
+            exclude.append(driver.port_name)
+        us_driver = UltrasonicUsbDriver(
+            port=ULTRASONIC_PORT,
+            baudrate=ULTRASONIC_BAUD,
+            on_range=publish_ultrasonic,
+            exclude_ports=exclude,
+        )
+        if not us_driver.connect():
+            print("  ℹ️ Ultrasuoni: riproverò in background quando il Nano sarà collegato.")
+    else:
+        print("  ℹ️ Ultrasuoni disabilitati (ULTRASONIC_ENABLED=false).")
+
     print("\n[SERIAL-BRIDGE] Servizio attivo in ascolto. Premi Ctrl+C per uscire.\n")
 
     while running:
         if not driver.is_connected:
             time.sleep(2.0)
             driver.connect()
-        else:
-            time.sleep(0.5)
+        if ULTRASONIC_ENABLED and us_driver and not us_driver.is_connected:
+            exclude = []
+            if driver and getattr(driver, "port_name", ""):
+                exclude.append(driver.port_name)
+            us_driver.exclude_ports = set(exclude)
+            us_driver.connect()
+        time.sleep(0.5)
 
 
 if __name__ == "__main__":
