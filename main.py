@@ -77,7 +77,8 @@ def on_arduino_telemetry(raw_line: str):
             "timestamp": time.time(),
             "raw": raw_line
         }
-        # Parse TLM:STATUS=...
+
+        # 1. Parsing prefisso TLM:...
         if raw_line.startswith("TLM:"):
             parts = raw_line[4:].split(",")
             for p in parts:
@@ -89,6 +90,38 @@ def on_arduino_telemetry(raw_line: str):
                             publish_ultrasonic(float(v))
                         except Exception:
                             pass
+
+        # 2. Parsing formato standard Arduino: "ULTRASONIC:25.4cm" o "US:25.4"
+        import re
+        us_match = re.search(r"(?:ULTRASONIC:|US:)\s*([0-9.]+)", raw_line, re.IGNORECASE)
+        if us_match:
+            try:
+                cm_val = float(us_match.group(1))
+                payload["ultrasonic_cm"] = cm_val
+                publish_ultrasonic(cm_val)
+            except Exception:
+                pass
+
+        # 3. Parsing Emergency Stop da sensore ultrasuoni: "EMERGENCY_STOP:12.0cm"
+        if "EMERGENCY_STOP" in raw_line:
+            stop_match = re.search(r"EMERGENCY_STOP:\s*([0-9.]+)", raw_line)
+            em_cm = float(stop_match.group(1)) if stop_match else 12.0
+            payload["emergency"] = True
+            payload["ultrasonic_cm"] = em_cm
+            publish_ultrasonic(em_cm)
+
+        # 4. Parsing formato JSON
+        if raw_line.startswith("{") and raw_line.endswith("}"):
+            try:
+                data = json.loads(raw_line)
+                for k in ("ultrasonic_cm", "ultrasonic", "us_cm", "us", "distance"):
+                    if k in data:
+                        cm_val = float(data[k])
+                        payload["ultrasonic_cm"] = cm_val
+                        publish_ultrasonic(cm_val)
+                        break
+            except Exception:
+                pass
 
         mqtt_client.publish("mar/hardware/telemetry", json.dumps(payload))
 
