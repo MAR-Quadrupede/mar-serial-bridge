@@ -62,41 +62,47 @@ class ArduinoSerialDriver:
         return ports
 
     def connect(self) -> bool:
-        """Establishes connection with Arduino."""
+        """Establishes connection with Arduino, trying configured port first, then auto-discovering."""
         if serial is None:
             print("[SERIAL-DRIVER] ⚠️ pySerial non è installato.")
             return False
 
-        target_port = self.port
-        if not target_port:
-            candidates = self.discover_ports()
-            if candidates:
-                target_port = candidates[0]
-            else:
-                print("[SERIAL-DRIVER] ⚠️ Nessun dispositivo Arduino rilevato.")
-                return False
+        ports_to_try = []
+        if self.port:
+            ports_to_try.append(self.port)
+        for p in self.discover_ports():
+            if p not in ports_to_try:
+                ports_to_try.append(p)
 
-        print(f"[SERIAL-DRIVER] Connessione a {target_port} ({self.baudrate} baud)...")
-        try:
-            self.serial = serial.Serial(
-                target_port,
-                self.baudrate,
-                timeout=self.timeout
-            )
-            self.port_name = target_port
-            self.is_connected = True
-            time.sleep(1.8)  # Wait for DTR auto-reset
-
-            self.running = True
-            self._thread = threading.Thread(target=self._read_loop, daemon=True)
-            self._thread.start()
-
-            print(f"  ✓ Connessione stabilita con Arduino su {target_port}")
-            return True
-        except Exception as e:
-            print(f"  ✗ Errore connessione a {target_port}: {e}")
-            self.is_connected = False
+        if not ports_to_try:
+            print("[SERIAL-DRIVER] ⚠️ Nessun dispositivo seriale rilevato.")
             return False
+
+        for target_port in ports_to_try:
+            print(f"[SERIAL-DRIVER] Tentativo connessione ad Arduino su {target_port} ({self.baudrate} baud)...")
+            try:
+                self.serial = serial.Serial(
+                    target_port,
+                    self.baudrate,
+                    timeout=self.timeout
+                )
+                self.port_name = target_port
+                self.is_connected = True
+                time.sleep(1.8)  # Wait for DTR auto-reset
+
+                self.running = True
+                self._thread = threading.Thread(target=self._read_loop, daemon=True)
+                self._thread.start()
+
+                print(f"  ✓ Connessione stabilita con Arduino su {target_port}")
+                return True
+            except Exception as e:
+                print(f"  · [SERIAL-DRIVER] Porta {target_port} non disponibile: {e}")
+                self.serial = None
+                continue
+
+        self.is_connected = False
+        return False
 
     def _read_loop(self):
         """Continuously reads incoming lines from Arduino."""

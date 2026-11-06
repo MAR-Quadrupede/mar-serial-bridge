@@ -44,6 +44,8 @@ IMU_RATE_HZ = float(os.getenv("IMU_RATE_HZ", "100"))
 
 # Makeblock Ultrasonic V3 on second Arduino (USB) — pin A2 sketch in local/
 ULTRASONIC_ENABLED = env_bool("ULTRASONIC_ENABLED", True)
+ULTRASONIC_SIMULATE = env_bool("ULTRASONIC_SIMULATE", False)
+ULTRASONIC_AUTO_FALLBACK = env_bool("ULTRASONIC_AUTO_FALLBACK", True)
 ULTRASONIC_PORT = os.getenv("ULTRASONIC_PORT", "")  # empty = auto (prefer ttyUSB*)
 ULTRASONIC_BAUD = int(os.getenv("ULTRASONIC_BAUD", "115200"))
 
@@ -260,9 +262,10 @@ def main():
             baudrate=ULTRASONIC_BAUD,
             on_range=publish_ultrasonic,
             exclude_ports=exclude,
+            simulated=ULTRASONIC_SIMULATE,
+            auto_fallback=ULTRASONIC_AUTO_FALLBACK,
         )
-        if not us_driver.connect():
-            print("  ℹ️ Ultrasuoni: riproverò in background quando il Nano sarà collegato.")
+        us_driver.connect()
     else:
         print("  ℹ️ Ultrasuoni disabilitati (ULTRASONIC_ENABLED=false).")
 
@@ -272,7 +275,7 @@ def main():
         if not driver.is_connected:
             time.sleep(2.0)
             driver.connect()
-        if ULTRASONIC_ENABLED and us_driver and not us_driver.is_connected:
+        if ULTRASONIC_ENABLED and us_driver and not us_driver.is_connected and not us_driver.simulated:
             exclude = []
             if driver and getattr(driver, "port_name", ""):
                 exclude.append(driver.port_name)
