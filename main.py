@@ -227,8 +227,8 @@ def on_mqtt_message(client, userdata, msg):
             if param != "":
                 formatted_cmd += f",{param}"
 
-        print(f"[FORWARD TO ARDUINO]: {formatted_cmd}")
-        if driver:
+        if driver and driver.is_connected:
+            print(f"[FORWARD TO ARDUINO]: {formatted_cmd}")
             driver.send_command(formatted_cmd)
 
 
