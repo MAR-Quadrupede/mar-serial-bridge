@@ -180,6 +180,24 @@ def on_imu_status(available: bool, reason: str):
         }))
 
 
+def on_mqtt_connect(client, userdata, flags, rc, properties=None):
+    """(Ri)sottoscrive i topic ad ogni connessione: resiste a riavvii del broker/DNS."""
+    code = getattr(rc, "value", rc)
+    if code == 0:
+        client.subscribe([("mar/control/motion", 0), ("mar/safety/estop", 2)])
+        print(f"  ✓ Connesso a MQTT Broker ({MQTT_BROKER}:{MQTT_PORT}) — topic sottoscritti")
+        # stato hardware e IMU subito disponibili alla dashboard
+        publish_hw_status()
+        if imu_driver:
+            on_imu_status(imu_driver.is_available, imu_driver.last_error)
+    else:
+        print(f"  ⚠️ MQTT connect rifiutato (rc={rc})")
+
+
+def on_mqtt_disconnect(client, userdata, *args):
+    print("  ⚠️ MQTT disconnesso: riconnessione automatica in corso...")
+
+
 def on_mqtt_message(client, userdata, msg):
     """Handles incoming motion commands from the Decision Engine or Operator."""
     topic = msg.topic
@@ -257,15 +275,19 @@ def main():
 
     # 3. Connessione MQTT (se disponibile)
     if mqtt:
+        # connect_async + loop_start: paho riprova da solo (anche se al boot il DNS del
+        # cluster non risolve ancora `mar-mosquitto`) e ri-sottoscrive in on_connect.
         try:
+            mqtt_client = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id="mar-serial-bridge")
+        except Exception:
             mqtt_client = mqtt.Client(client_id="mar-serial-bridge")
-            mqtt_client.on_message = on_mqtt_message
-            mqtt_client.connect(MQTT_BROKER, MQTT_PORT, 60)
-            mqtt_client.subscribe([("mar/control/motion", 0), ("mar/safety/estop", 2)])
-            mqtt_client.loop_start()
-            print(f"  ✓ Connesso a MQTT Broker ({MQTT_BROKER}:{MQTT_PORT})")
-        except Exception as e:
-            print(f"  ⚠️ Connessione MQTT non riuscita ({e}). Modalità autonoma.")
+        mqtt_client.on_connect = on_mqtt_connect
+        mqtt_client.on_disconnect = on_mqtt_disconnect
+        mqtt_client.on_message = on_mqtt_message
+        mqtt_client.reconnect_delay_set(min_delay=1, max_delay=10)
+        mqtt_client.connect_async(MQTT_BROKER, MQTT_PORT, 60)
+        mqtt_client.loop_start()
+        print(f"  ✓ MQTT loop avviato verso {MQTT_BROKER}:{MQTT_PORT} (retry automatico)")
 
     # 4. IMU GY-521 / MPU-6050: acquisizione raw verso `mar/imu/raw`
     if IMU_ENABLED:
@@ -277,7 +299,8 @@ def main():
             on_status=on_imu_status
         )
         imu_driver.start()
-        print(f"  ✓ IMU: lettura I2C avviata a {IMU_RATE_HZ:.0f} Hz su /dev/i2c-{IMU_I2C_BUS}")
+        print(f"  ✓ IMU: hot-plug I2C su /dev/i2c-{IMU_I2C_BUS} @0x{IMU_ADDRESS:02X}/0x69 "
+              f"a {IMU_RATE_HZ:.0f} Hz (ok se assente: si collega da sola all'arrivo)")
     else:
         print("  ℹ️ IMU disabilitata (IMU_ENABLED=false).")
 

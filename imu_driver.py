@@ -23,9 +23,20 @@ except ImportError:
 
 # MPU-6050 register map (subset used here)
 MPU6050_ADDR_DEFAULT = 0x68
+MPU6050_ADDR_ALT = 0x69  # AD0 tied to VCC
 PWR_MGMT_1 = 0x6B
 ACCEL_XOUT_H = 0x3B
 WHO_AM_I = 0x75
+WHO_AM_I_OK = (0x68, 0x69, 0x70, 0x71, 0x72, 0x73, 0x74, 0x98)
+
+
+def candidate_imu_addresses(preferred: int = MPU6050_ADDR_DEFAULT):
+    """GY-521 / MPU-6050: 0x68 (AD0 low) or 0x69 (AD0 high). Preferred first."""
+    out = []
+    for addr in (preferred, MPU6050_ADDR_DEFAULT, MPU6050_ADDR_ALT):
+        if addr not in out:
+            out.append(addr)
+    return out
 
 # Full-scale defaults (FS_SEL=0 -> ±250 °/s, AFS_SEL=0 -> ±2 g)
 GYRO_SCALE_COUNTS = 131.0     # LSB per (°/s)
@@ -77,26 +88,48 @@ class MPU6050Driver:
 
         try:
             bus = smbus2.SMBus(self.bus_number)
-            # Wake device: clear SLEEP bit, use internal 8 MHz oscillator
-            bus.write_byte_data(self.address, PWR_MGMT_1, 0x00)
-            time.sleep(0.05)
-            # Sanity check (WHO_AM_I == 0x68); tolerate clones that do not answer
+        except Exception as e:
+            self._set_status(False, f"I2C /dev/i2c-{self.bus_number} non apribile ({e})")
+            return False
+
+        last_err = "nessun ACK"
+        chosen = None
+        who_ok = None
+        for addr in candidate_imu_addresses(self.address):
             try:
-                who = bus.read_byte_data(self.address, WHO_AM_I)
-                if who not in (0x68, 0x69, 0x70, 0x71, 0x72, 0x73, 0x74, 0x98):
-                    bus.close()
-                    self._set_status(False, f"WHO_AM_I inatteso su 0x{self.address:02X}: 0x{who:02X}")
-                    return False
+                bus.write_byte_data(addr, PWR_MGMT_1, 0x00)
+                time.sleep(0.05)
+                try:
+                    who = bus.read_byte_data(addr, WHO_AM_I)
+                except Exception:
+                    who = None
+                if who is not None and who not in WHO_AM_I_OK:
+                    last_err = f"WHO_AM_I inatteso su 0x{addr:02X}: 0x{who:02X}"
+                    continue
+                chosen = addr
+                who_ok = who
+                break
+            except Exception as e:
+                last_err = str(e)
+                continue
+
+        if chosen is None:
+            try:
+                bus.close()
             except Exception:
                 pass
-
-            with self._lock:
-                self.bus = bus
-            self._set_status(True, f"MPU-6050 attiva su /dev/i2c-{self.bus_number} @0x{self.address:02X}")
-            return True
-        except Exception as e:
-            self._set_status(False, f"IMU non rilevata su I2C ({e})")
+            self._set_status(
+                False,
+                f"IMU in attesa su /dev/i2c-{self.bus_number} (0x68/0x69) — {last_err}"
+            )
             return False
+
+        self.address = chosen
+        with self._lock:
+            self.bus = bus
+        who_txt = f" WHO_AM_I=0x{who_ok:02X}" if who_ok is not None else ""
+        self._set_status(True, f"MPU-6050 attiva su /dev/i2c-{self.bus_number} @0x{self.address:02X}{who_txt}")
+        return True
 
     def read_raw(self) -> Optional[Tuple[List[int], List[int]]]:
         """Reads accel + gyro from the 14-byte burst. Returns (gyro, accel) raw counts."""
