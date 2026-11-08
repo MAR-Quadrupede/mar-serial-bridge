@@ -61,48 +61,48 @@ class ArduinoSerialDriver:
                 ports.append(c)
         return ports
 
-    def connect(self) -> bool:
-        """Establishes connection with Arduino, trying configured port first, then auto-discovering."""
+    def connect(self, port: Optional[str] = None) -> bool:
+        """
+        Si connette al controller motion sulla porta indicata (o su self.port).
+        NON fa più auto-discovery "prendi la prima porta che si apre": il ruolo della porta
+        viene deciso a monte (port_roles.probe_port_role) per non agganciare per sbaglio
+        l'Arduino degli ultrasuoni.
+        """
         if serial is None:
             print("[SERIAL-DRIVER] ⚠️ pySerial non è installato.")
             return False
 
-        ports_to_try = []
-        if self.port:
-            ports_to_try.append(self.port)
-        for p in self.discover_ports():
-            if p not in ports_to_try:
-                ports_to_try.append(p)
-
-        if not ports_to_try:
-            print("[SERIAL-DRIVER] ⚠️ Nessun dispositivo seriale rilevato.")
+        target_port = (port or self.port or "").strip()
+        if not target_port:
             return False
 
-        for target_port in ports_to_try:
-            print(f"[SERIAL-DRIVER] Tentativo connessione ad Arduino su {target_port} ({self.baudrate} baud)...")
+        print(f"[SERIAL-DRIVER] Connessione al controller motion su {target_port} ({self.baudrate} baud)...")
+        try:
+            self.serial = serial.Serial(
+                target_port,
+                self.baudrate,
+                timeout=self.timeout,
+                exclusive=True,
+            )
+            self.port_name = target_port
+            self.is_connected = True
+            time.sleep(1.8)  # Wait for DTR auto-reset
             try:
-                self.serial = serial.Serial(
-                    target_port,
-                    self.baudrate,
-                    timeout=self.timeout
-                )
-                self.port_name = target_port
-                self.is_connected = True
-                time.sleep(1.8)  # Wait for DTR auto-reset
+                self.serial.reset_input_buffer()
+            except Exception:
+                pass
 
-                self.running = True
-                self._thread = threading.Thread(target=self._read_loop, daemon=True)
-                self._thread.start()
+            self.running = True
+            self._thread = threading.Thread(target=self._read_loop, daemon=True)
+            self._thread.start()
 
-                print(f"  ✓ Connessione stabilita con Arduino su {target_port}")
-                return True
-            except Exception as e:
-                print(f"  · [SERIAL-DRIVER] Porta {target_port} non disponibile: {e}")
-                self.serial = None
-                continue
-
-        self.is_connected = False
-        return False
+            print(f"  ✓ Connessione stabilita con Arduino motion su {target_port}")
+            return True
+        except Exception as e:
+            print(f"  · [SERIAL-DRIVER] Porta {target_port} non disponibile: {e}")
+            self.serial = None
+            self.is_connected = False
+            return False
 
     def _read_loop(self):
         """Continuously reads incoming lines from Arduino."""
@@ -136,6 +136,15 @@ class ArduinoSerialDriver:
                         self.on_telemetry(line)
 
                 time.sleep(0.01)
+            except (OSError, serial.SerialException) as e:
+                print(f"[SERIAL-DRIVER] ✗ Porta {self.port_name} persa: {e}")
+                self.is_connected = False
+                self.running = False
+                try:
+                    self.serial.close()
+                except Exception:
+                    pass
+                break
             except Exception:
                 time.sleep(0.1)
 

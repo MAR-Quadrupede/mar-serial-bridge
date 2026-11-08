@@ -15,6 +15,7 @@ import threading
 from serial_driver import ArduinoSerialDriver
 from imu_driver import MPU6050Driver
 from ultrasonic_driver import UltrasonicUsbDriver
+from port_roles import list_usb_serial_ports, probe_port_role
 
 # Optional MQTT import
 try:
@@ -45,9 +46,16 @@ IMU_RATE_HZ = float(os.getenv("IMU_RATE_HZ", "100"))
 # Makeblock Ultrasonic V3 on second Arduino (USB) — pin A2 sketch in local/
 ULTRASONIC_ENABLED = env_bool("ULTRASONIC_ENABLED", True)
 ULTRASONIC_SIMULATE = env_bool("ULTRASONIC_SIMULATE", False)
-ULTRASONIC_AUTO_FALLBACK = env_bool("ULTRASONIC_AUTO_FALLBACK", True)
-ULTRASONIC_PORT = os.getenv("ULTRASONIC_PORT", "")  # empty = auto (prefer ttyUSB*)
+# Default OFF: una distanza finta di 300 cm non deve mai entrare nella sicurezza del robot
+ULTRASONIC_AUTO_FALLBACK = env_bool("ULTRASONIC_AUTO_FALLBACK", False)
+ULTRASONIC_PORT = os.getenv("ULTRASONIC_PORT", "")  # empty = auto (ruolo identificato dal banner)
 ULTRASONIC_BAUD = int(os.getenv("ULTRASONIC_BAUD", "115200"))
+PORT_RESCAN_S = float(os.getenv("PORT_RESCAN_S", "10.0"))
+STATUS_HZ = float(os.getenv("HW_STATUS_HZ", "1.0"))
+
+# Ruoli porta assegnati (porta → ruolo) e porte già classificate come "unknown"
+port_roles: dict = {}
+unknown_ports: dict = {}   # porta → timestamp ultimo probe
 
 running = True
 driver: ArduinoSerialDriver = None
@@ -56,8 +64,8 @@ us_driver: UltrasonicUsbDriver = None
 mqtt_client = None
 
 
-def publish_ultrasonic(cm: float):
-    """Publish frontal ultrasonic range (Makeblock V3 / Arduino USB)."""
+def publish_ultrasonic(cm: float, source: str = "makeblock_v3_a2", simulated: bool = False):
+    """Publish frontal ultrasonic range. `simulated=True` → il decision engine lo IGNORA."""
     if not (mqtt_client and mqtt_client.is_connected()):
         return
     payload = {
@@ -65,15 +73,36 @@ def publish_ultrasonic(cm: float):
         "us_cm": round(float(cm), 1),
         "ultrasonic_cm": round(float(cm), 1),
         "ultrasonic": round(float(cm), 1),
-        "source": "makeblock_v3_a2",
+        "source": source,
+        "simulated": bool(simulated),
     }
     mqtt_client.publish("mar/ultrasonic/range", json.dumps(payload))
     mqtt_client.publish("mar/hardware/telemetry", json.dumps(payload))
 
 
+def publish_hw_status():
+    """Stato connessioni hardware (1 Hz) → dashboard / decision engine."""
+    if not (mqtt_client and mqtt_client.is_connected()):
+        return
+    mqtt_client.publish("mar/hardware/status", json.dumps({
+        "timestamp": time.time(),
+        "motion_connected": bool(driver and driver.is_connected),
+        "motion_port": (driver.port_name if driver and driver.is_connected else None),
+        "motion_status": (driver.status_string if driver else "DISCONNECTED"),
+        "ultrasonic_connected": bool(us_driver and us_driver.is_connected and not us_driver.simulated),
+        "ultrasonic_port": (us_driver.port_name if us_driver and us_driver.is_connected else None),
+        "ultrasonic_simulated": bool(us_driver and us_driver.simulated),
+        "ultrasonic_cm": (us_driver.distance_cm if us_driver else None),
+        "imu_enabled": IMU_ENABLED,
+        "port_roles": dict(port_roles),
+        "unknown_ports": sorted(unknown_ports.keys()),
+    }))
+
+
 def on_arduino_telemetry(raw_line: str):
     """Callback when a telemetry string arrives from Arduino."""
-    print(f"[TELEMETRY RX]: {raw_line}")
+    if not (raw_line.startswith("US:") or raw_line.startswith("TLM:US=") or raw_line == "PONG"):
+        print(f"[TELEMETRY RX]: {raw_line}")
     if mqtt_client and mqtt_client.is_connected():
         payload = {
             "timestamp": time.time(),
@@ -89,7 +118,7 @@ def on_arduino_telemetry(raw_line: str):
                     payload[k.lower()] = v
                     if k.lower() in ("us", "ultrasonic", "us_cm"):
                         try:
-                            publish_ultrasonic(float(v))
+                            publish_ultrasonic(float(v), source="motion_controller")
                         except Exception:
                             pass
 
@@ -100,7 +129,7 @@ def on_arduino_telemetry(raw_line: str):
             try:
                 cm_val = float(us_match.group(1))
                 payload["ultrasonic_cm"] = cm_val
-                publish_ultrasonic(cm_val)
+                publish_ultrasonic(cm_val, source="motion_controller")
             except Exception:
                 pass
 
@@ -110,7 +139,7 @@ def on_arduino_telemetry(raw_line: str):
             em_cm = float(stop_match.group(1)) if stop_match else 12.0
             payload["emergency"] = True
             payload["ultrasonic_cm"] = em_cm
-            publish_ultrasonic(em_cm)
+            publish_ultrasonic(em_cm, source="motion_controller")
 
         # 4. Parsing formato JSON
         if raw_line.startswith("{") and raw_line.endswith("}"):
@@ -120,7 +149,7 @@ def on_arduino_telemetry(raw_line: str):
                     if k in data:
                         cm_val = float(data[k])
                         payload["ultrasonic_cm"] = cm_val
-                        publish_ultrasonic(cm_val)
+                        publish_ultrasonic(cm_val, source="motion_controller")
                         break
             except Exception:
                 pass
@@ -212,15 +241,12 @@ def main():
     print(" 🐾 M.A.R. — SERIAL BRIDGE & HARDWARE ABSTRACTION DAEMON")
     print("=" * 60)
 
-    # 1. Inizializza driver seriale
+    # 1. Driver seriali (le porte vengono assegnate dopo l'identificazione del ruolo)
     driver = ArduinoSerialDriver(
         port=SERIAL_PORT,
         baudrate=BAUDRATE,
         on_telemetry=on_arduino_telemetry
     )
-    connected = driver.connect()
-    if not connected:
-        print("[SERIAL-BRIDGE] ⚠️ Impossibile agganciare Arduino. Riproverò in background...")
 
     # 2. Avvia Heartbeat Watchdog Thread
     hb_thread = threading.Thread(target=heartbeat_loop, daemon=True)
@@ -252,36 +278,113 @@ def main():
     else:
         print("  ℹ️ IMU disabilitata (IMU_ENABLED=false).")
 
-    # 5. Ultrasuoni Makeblock su Arduino USB dedicato (escluso il port motion)
+    # 5. Ultrasuoni Makeblock su Arduino USB dedicato
     if ULTRASONIC_ENABLED:
-        exclude = []
-        if driver and getattr(driver, "port_name", ""):
-            exclude.append(driver.port_name)
         us_driver = UltrasonicUsbDriver(
             port=ULTRASONIC_PORT,
             baudrate=ULTRASONIC_BAUD,
             on_range=publish_ultrasonic,
-            exclude_ports=exclude,
             simulated=ULTRASONIC_SIMULATE,
-            auto_fallback=ULTRASONIC_AUTO_FALLBACK,
+            auto_fallback=False,  # il fallback viene deciso qui sotto, dopo la scansione porte
         )
-        us_driver.connect()
+        if ULTRASONIC_SIMULATE:
+            us_driver.connect()
     else:
         print("  ℹ️ Ultrasuoni disabilitati (ULTRASONIC_ENABLED=false).")
 
+    # 6. Identificazione ruolo porte + connessione
+    assign_ports(first=True)
+
     print("\n[SERIAL-BRIDGE] Servizio attivo in ascolto. Premi Ctrl+C per uscire.\n")
 
+    last_rescan = time.time()
+    last_status = 0.0
     while running:
+        now = time.time()
+        need_motion = not driver.is_connected
+        need_us = ULTRASONIC_ENABLED and us_driver is not None and not us_driver.is_connected
+        if (need_motion or need_us) and (now - last_rescan) >= PORT_RESCAN_S:
+            last_rescan = now
+            assign_ports(first=False)
+        if now - last_status >= 1.0 / max(0.1, STATUS_HZ):
+            last_status = now
+            publish_hw_status()
+        time.sleep(0.25)
+
+
+def assign_ports(first: bool):
+    """Sonda le porte USB non ancora assegnate, ne identifica il ruolo e collega i driver."""
+    global port_roles
+    # porte preferite da env: provate per prime, ma il ruolo viene comunque verificato dal banner
+    # (una config vecchia con SERIAL_PORT=/dev/ttyUSB0 non deve far agganciare l'Arduino ultrasuoni come motion)
+    for pref, want in ((SERIAL_PORT, "motion"), (ULTRASONIC_PORT, "ultrasonic")):
+        if not pref or not os.path.exists(pref) or pref in port_roles:
+            continue
+        if want == "motion" and driver.is_connected:
+            continue
+        if want == "ultrasonic" and (not ULTRASONIC_ENABLED or us_driver is None or us_driver.is_connected):
+            continue
+        probe = probe_port_role(pref, baudrate=BAUDRATE)
+        if probe.role == want or probe.role == "unknown":
+            ok = driver.connect(pref) if want == "motion" else us_driver.connect(pref)
+            if ok:
+                port_roles[pref] = want
+                if probe.role == "unknown":
+                    print(f"[SERIAL-BRIDGE] {pref}: ruolo non identificato, uso la porta forzata come {want}")
+        else:
+            print(f"[SERIAL-BRIDGE] ⚠️ {pref} forzata come {want} ma il banner dice '{probe.role}': ignoro la forzatura")
+            if probe.role in ("motion", "ultrasonic"):
+                # assegna comunque al ruolo corretto
+                if probe.role == "motion" and not driver.is_connected and driver.connect(pref):
+                    port_roles[pref] = "motion"
+                elif probe.role == "ultrasonic" and ULTRASONIC_ENABLED and us_driver and not us_driver.is_connected and us_driver.connect(pref):
+                    port_roles[pref] = "ultrasonic"
+
+    # dimentica le porte scomparse
+    for p in list(port_roles.keys()):
+        if not os.path.exists(p):
+            port_roles.pop(p, None)
+    for p in list(unknown_ports.keys()):
+        if not os.path.exists(p):
+            unknown_ports.pop(p, None)
+
+    busy = set(port_roles.keys())
+    if driver.is_connected:
+        busy.add(driver.port_name)
+    if us_driver and us_driver.is_connected and not us_driver.simulated:
+        busy.add(us_driver.port_name)
+
+    candidates = [p for p in list_usb_serial_ports(exclude=list(busy))
+                  if (time.time() - unknown_ports.get(p, 0.0)) > 60.0]  # riprova le "unknown" ogni 60 s
+    if first:
+        print(f"[SERIAL-BRIDGE] Porte USB candidate: {candidates or 'nessuna'}")
+
+    for p in candidates:
+        if driver.is_connected and (not ULTRASONIC_ENABLED or us_driver is None or us_driver.is_connected):
+            break
+        probe = probe_port_role(p, baudrate=BAUDRATE)
+        print(f"[SERIAL-BRIDGE] {p} → ruolo={probe.role} {('| ' + probe.note) if probe.note else ''} "
+              f"{('| ' + ' / '.join(probe.lines[-3:])) if probe.lines else ''}")
+        if probe.role == "motion" and not driver.is_connected:
+            if driver.connect(p):
+                port_roles[p] = "motion"
+        elif probe.role == "ultrasonic" and ULTRASONIC_ENABLED and us_driver and not us_driver.is_connected:
+            if us_driver.connect(p):
+                port_roles[p] = "ultrasonic"
+        elif probe.role in ("unknown", "error"):
+            unknown_ports[p] = time.time()
+        # "busy" → occupata da un altro processo (es. LiDAR): riproveremo al prossimo giro
+
+    if first:
         if not driver.is_connected:
-            time.sleep(2.0)
-            driver.connect()
-        if ULTRASONIC_ENABLED and us_driver and not us_driver.is_connected and not us_driver.simulated:
-            exclude = []
-            if driver and getattr(driver, "port_name", ""):
-                exclude.append(driver.port_name)
-            us_driver.exclude_ports = set(exclude)
-            us_driver.connect()
-        time.sleep(0.5)
+            print("[SERIAL-BRIDGE] ⚠️ Controller motion NON trovato: i comandi CMD: non verranno inviati (riprovo ogni "
+                  f"{PORT_RESCAN_S:.0f}s)")
+        if ULTRASONIC_ENABLED and us_driver and not us_driver.is_connected:
+            if ULTRASONIC_AUTO_FALLBACK:
+                us_driver.auto_fallback = True
+                us_driver.connect()
+            else:
+                print("[SERIAL-BRIDGE] ⚠️ Arduino ultrasuoni NON trovato: nessun dato US (nessuna simulazione)")
 
 
 if __name__ == "__main__":

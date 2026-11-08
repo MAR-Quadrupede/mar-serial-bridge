@@ -28,7 +28,7 @@ class UltrasonicUsbDriver:
         self,
         port: str = "",
         baudrate: int = 115200,
-        on_range: Optional[Callable[[float], None]] = None,
+        on_range: Optional[Callable[[float, str, bool], None]] = None,
         exclude_ports: Optional[List[str]] = None,
         simulated: bool = False,
         auto_fallback: bool = True,
@@ -57,56 +57,32 @@ class UltrasonicUsbDriver:
                     ports.append(p)
         return ports
 
-    def connect(self) -> bool:
+    def connect(self, port: Optional[str] = None) -> bool:
+        """
+        Si connette all'Arduino ultrasuoni sulla porta indicata (ruolo deciso da port_roles).
+        Con simulated=True (o auto_fallback e nessuna porta) genera 300 cm MARCATI come simulati:
+        il decision engine li ignora nella fusione di sicurezza.
+        """
         if self.simulated:
-            print("  🧪 [US-DRIVER] Avvio ultrasuoni in modalità SIMULATA (corrispondenza corridoio 3.0m).")
-            self.is_connected = True
-            self.running = True
-            self.port_name = "SIMULATED_US"
-            self._thread = threading.Thread(target=self._sim_loop, daemon=True, name="us-sim")
-            self._thread.start()
-            return True
+            return self._start_sim("ULTRASONIC_SIMULATE=1")
 
         if serial is None:
             print("[US-DRIVER] pySerial mancante")
             return False
 
-        candidates = []
-        if self.port:
-            candidates.append(self.port)
-        for p in self.discover_ports(list(self.exclude_ports)):
-            if p not in candidates:
-                candidates.append(p)
-
-        for p in candidates:
+        target = (port or self.port or "").strip()
+        if target:
             try:
-                ser = serial.Serial(p, self.baudrate, timeout=0.4)
+                ser = serial.Serial(target, self.baudrate, timeout=0.4, exclusive=True)
                 time.sleep(1.6)  # DTR reset Nano/Micro
                 ser.reset_input_buffer()
-                # Probe briefly for US: lines / ready banner
-                t0 = time.time()
-                got = False
-                while time.time() - t0 < 2.5:
-                    line = ser.readline().decode("utf-8", errors="ignore").strip()
-                    if not line:
-                        continue
-                    if "MAR_US_READY" in line or US_LINE_RE.search(line) or "ULTRASONIC" in line.upper() or "TLM:" in line.upper():
-                        got = True
-                        break
-                if not got and self.port and p == self.port:
-                    # Forced port: accept anyway
-                    got = True
-                if not got:
-                    ser.close()
-                    continue
-
                 self.serial = ser
-                self.port_name = p
+                self.port_name = target
                 self.is_connected = True
                 self.running = True
                 self._thread = threading.Thread(target=self._read_loop, daemon=True, name="us-usb")
                 self._thread.start()
-                print(f"  ✓ [US-DRIVER] Ultrasuoni USB su {p} @ {self.baudrate}")
+                print(f"  ✓ [US-DRIVER] Ultrasuoni USB su {target} @ {self.baudrate}")
                 return True
             except Exception as e:
                 try:
@@ -115,21 +91,23 @@ class UltrasonicUsbDriver:
                 except Exception:
                     pass
                 self.serial = None
-                print(f"  · [US-DRIVER] skip {p}: {e}")
+                print(f"  · [US-DRIVER] {target} non disponibile: {e}")
 
         if self.auto_fallback:
-            print("  🧪 [US-DRIVER] Nessun Arduino ultrasuoni fisico trovato sui port USB -> attivazione automatica fallback (corridoio 3.0m).")
-            self.simulated = True
-            self.is_connected = True
-            self.running = True
-            self.port_name = "SIMULATED_US"
-            self._thread = threading.Thread(target=self._sim_loop, daemon=True, name="us-sim")
-            self._thread.start()
-            return True
+            return self._start_sim("nessun Arduino ultrasuoni fisico (ULTRASONIC_AUTO_FALLBACK=1)")
 
-        print("  ⚠️ [US-DRIVER] Nessun Arduino ultrasuoni fisico trovato sui port USB.")
         self.is_connected = False
         return False
+
+    def _start_sim(self, why: str) -> bool:
+        print(f"  🧪 [US-DRIVER] Ultrasuoni SIMULATI (300 cm, flag simulated=true) — {why}")
+        self.simulated = True
+        self.is_connected = True
+        self.running = True
+        self.port_name = "SIMULATED_US"
+        self._thread = threading.Thread(target=self._sim_loop, daemon=True, name="us-sim")
+        self._thread.start()
+        return True
 
     def _sim_loop(self):
         """Simulazione telemetria ultrasuoni a 15 Hz in accordo con stanza aperta."""
@@ -140,7 +118,7 @@ class UltrasonicUsbDriver:
             self.distance_cm = sim_cm
             self.last_ok_time = time.time()
             if self.on_range:
-                self.on_range(sim_cm)
+                self.on_range(sim_cm, "SIMULATED_US", True)
             time.sleep(0.066)  # ~15 Hz
 
     def _read_loop(self):
@@ -175,7 +153,17 @@ class UltrasonicUsbDriver:
                     self.distance_cm = cm
                     self.last_ok_time = time.time()
                     if self.on_range:
-                        self.on_range(cm)
+                        self.on_range(cm, "makeblock_v3_a2", False)
+            except (OSError, serial.SerialException) as e:
+                print(f"[US-DRIVER] ✗ Porta {self.port_name} persa: {e}")
+                self.is_connected = False
+                self.running = False
+                try:
+                    self.serial.close()
+                except Exception:
+                    pass
+                self.serial = None
+                break
             except Exception:
                 time.sleep(0.05)
 
