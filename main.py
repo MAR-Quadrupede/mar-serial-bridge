@@ -94,6 +94,9 @@ def publish_hw_status():
         "ultrasonic_simulated": bool(us_driver and us_driver.simulated),
         "ultrasonic_cm": (us_driver.distance_cm if us_driver else None),
         "imu_enabled": IMU_ENABLED,
+        "imu_connected": bool(imu_driver and imu_driver.is_available),
+        "imu_status": (imu_driver.last_error if imu_driver else "disabled"),
+        "imu_samples": (imu_driver.samples_read if imu_driver else 0),
         "port_roles": dict(port_roles),
         "unknown_ports": sorted(unknown_ports.keys()),
     }))

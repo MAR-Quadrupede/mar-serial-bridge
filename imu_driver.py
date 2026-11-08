@@ -108,8 +108,10 @@ class MPU6050Driver:
         try:
             block = bus.read_i2c_block_data(self.address, ACCEL_XOUT_H, 14)
         except Exception as e:
-            self._set_status(False, f"Errore lettura I2C ({e})")
-            self.close()
+            # Rilascia il bus ma NON fermare il thread: la `_loop` riproverà
+            # `open()` ogni `retry_sec` → hot-plug / glitch I2C tollerati.
+            self._set_status(False, f"Errore lettura I2C ({e}) — riprovo tra {self.retry_sec:.0f}s")
+            self._release_bus()
             return None
 
         acc = [
@@ -175,9 +177,8 @@ class MPU6050Driver:
             else:
                 next_tick = time.time()
 
-    def close(self):
-        """Stops the acquisition thread and releases the I2C bus."""
-        self._running = False
+    def _release_bus(self):
+        """Releases the I2C handle (keeps the acquisition thread alive)."""
         with self._lock:
             if self.bus is not None:
                 try:
@@ -185,6 +186,11 @@ class MPU6050Driver:
                 except Exception:
                     pass
                 self.bus = None
+
+    def close(self):
+        """Stops the acquisition thread and releases the I2C bus."""
+        self._running = False
+        self._release_bus()
         if self.is_available:
             self._set_status(False, "IMU disconnessa")
 
