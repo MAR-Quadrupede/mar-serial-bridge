@@ -75,6 +75,8 @@ def publish_ultrasonic(cm: float, source: str = "makeblock_v3_a2", simulated: bo
         "ultrasonic": round(float(cm), 1),
         "source": source,
         "simulated": bool(simulated),
+        # 400 cm è il timeout dello sketch (pulseIn senza eco), non una distanza.
+        "echo": bool(simulated) or float(cm) < 390.0,
     }
     mqtt_client.publish("mar/ultrasonic/range", json.dumps(payload))
     mqtt_client.publish("mar/hardware/telemetry", json.dumps(payload))
